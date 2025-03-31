@@ -1,4 +1,4 @@
-Location to stor Custom powershell scripts for supporting Teams Calling environments
+Location for Custom powershell scripts for supporting Teams Calling environments
 
 ContactImport.ps1 - (Leverages the module of AADInternals)
   Prompts for targeted User UPN (Can be a User or a CAP account)
