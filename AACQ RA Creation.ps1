@@ -6,9 +6,6 @@ Bulk Creation and Licensing of Teams Resource Accounts (Auto Attendants & Call Q
 This PowerShell script streamlines the creation of Microsoft Teams Resource Accounts for Auto Attendants and Call Queues by processing data from separate CSV files. It also offers the option to automatically assign the 'Microsoft Teams Phone Resource Account' license and set the Usage Location to 'AU' for these accounts.
 
 .NOTES
-Author: Your Name/Organization
-Version: 1.0
-Date: 2025-04-09
 
 Requires:
  - Microsoft Teams PowerShell Module (Install-Module MicrosoftTeams)
