@@ -1,4 +1,4 @@
-﻿<#
+<#
 .SYNOPSIS
     WPF GUI for managing Teams holiday schedules with embedded Create/Update logic.
 
@@ -140,18 +140,24 @@ function Build-HolidayRangesFromJson {
         $rawDates = $data | Where-Object { $_.states -contains $State } | Select-Object -ExpandProperty date
         Add-LogLine "Raw dates for $State in $($file.Name): $($rawDates -join ', ')"
 
-        # Filter and convert valid YYYY-MM-DD dates
-        $dates = $rawDates | Where-Object { $_ -and ($_ -match '^\d{4}-\d{2}-\d{2}$') } | ForEach-Object { [DateTime]$_ }
+        # Filter and convert valid YYYY-MM-DD dates -> [datetime]
+        $dates = $rawDates |
+            Where-Object { $_ -and ($_ -match '^\d{4}-\d{2}-\d{2}$') } |
+            ForEach-Object { [DateTime]$_ }
+
         if (-not $dates -or $dates.Count -eq 0) {
             Add-LogLine "No valid holiday dates found for $State in $($file.Name)"
             continue
         }
 
-        # Build DateTimeRanges for Teams
+        # Build DateTimeRanges for Teams with real DateTime values
         $dateRanges = foreach ($d in $dates) {
+            $start = Get-Date -Year $d.Year -Month $d.Month -Day $d.Day -Hour 0 -Minute 0 -Second 0
+            $end   = Get-Date -Year $d.Year -Month $d.Month -Day $d.Day -Hour 23 -Minute 45 -Second 0
+
             @{
-                Start = $d.ToString("yyyy-MM-ddT00:00:00")
-                End   = $d.ToString("yyyy-MM-ddT23:59:59")
+                Start = $start
+                End   = $end
             }
         }
 
@@ -176,7 +182,7 @@ function Create-HolidaySchedule {
         return
     }
 
-    # NEW NAMING: "NSW Public Holidays", "VIC Public Holidays", etc.
+    # Name like "NSW Public Holidays"
     $scheduleName = "$State Public Holidays"
     Add-LogLine "Calculated schedule name: $scheduleName"
     Add-LogLine "Number of date ranges to create: $($ranges.Count)"
@@ -188,7 +194,7 @@ function Create-HolidaySchedule {
 
     try {
         Add-LogLine "Creating schedule '$scheduleName'..."
-        New-CsOnlineSchedule -Name $scheduleName -Type Holiday -DateTimeRanges $ranges -ErrorAction Stop | Out-Null
+        New-CsOnlineSchedule -Name $scheduleName -FixedSchedule -DateTimeRanges $ranges -ErrorAction Stop | Out-Null
         Add-LogLine "Successfully created schedule '$scheduleName'."
         Add-LogLine "IMPORTANT: Connect this new holiday schedule to the correct Auto Attendant in the Teams admin centre."
     }
@@ -206,51 +212,43 @@ function Update-HolidaySchedule {
 
     Add-LogLine "Preparing to UPDATE holiday schedule for state: $State"
 
-    # NEW NAMING: "NSW Public Holidays", etc.
     $scheduleName = "$State Public Holidays"
-    # Try exact match first
-    $schedule = Get-CsOnlineSchedule -ErrorAction SilentlyContinue |
-        Where-Object { $_.Name -eq "$State Public Holidays" }
 
-    # If no exact match, try startswith (handles trailing spaces, etc.)
+    # Slightly fuzzy lookup in case of tiny name differences
+    $allSchedules = Get-CsOnlineSchedule -ErrorAction SilentlyContinue
+    $schedule = $allSchedules | Where-Object { $_.Name -eq $scheduleName }
+
     if (-not $schedule) {
-        $schedule = Get-CsOnlineSchedule -ErrorAction SilentlyContinue |
-            Where-Object { $_.Name -like "$State Public Holidays*" }
+        $schedule = $allSchedules | Where-Object { $_.Name -like "$scheduleName*" }
     }
-
-    # If still no match, try contains
     if (-not $schedule) {
-        $schedule = Get-CsOnlineSchedule -ErrorAction SilentlyContinue |
-            Where-Object { $_.Name -like "*$State*" -and $_.Name -like "*Public Holidays*" }
+        $schedule = $allSchedules | Where-Object { $_.Name -like "*$State*" -and $_.Name -like "*Public Holidays*" }
     }
 
     if (-not $schedule) {
-        Add-LogLine "No existing schedule located for: '$State Public Holidays'. Possible naming mismatch."
-        return
-    }
-    if (-not $schedule) {
-        Add-LogLine "No existing schedule named '$scheduleName'. Cannot update, skipping."
+        Add-LogLine "No existing schedule located for: '$scheduleName'. Possible naming mismatch. Skipping."
         return
     }
 
+    # Normalise existing ranges as DateTime
     $existingRanges = @()
     if ($schedule.DateTimeRanges) {
         $existingRanges = $schedule.DateTimeRanges | ForEach-Object {
             @{
-                Start = ([DateTime]$_.Start).ToString("yyyy-MM-ddT00:00:00")
-                End   = ([DateTime]$_.End).ToString("yyyy-MM-ddT23:59:59")
+                Start = [datetime]$_.Start
+                End   = [datetime]$_.End
             }
         }
     }
 
     $holidayRanges = Build-HolidayRangesFromJson -Directory $HolidayJsonDir -State $State
 
-    # Filter to only future dates (from today onwards)
+    # Filter to only future dates (from today onwards) for NEW holidays
     $today = (Get-Date).Date
     Add-LogLine "Filtering out holidays that have already occurred. Today: $today"
 
     $holidayRanges = $holidayRanges | Where-Object {
-        ([DateTime]$_.Start).Date -ge $today
+        $_.Start.Date -ge $today
     }
 
     if (-not $holidayRanges -or $holidayRanges.Count -eq 0) {
@@ -258,52 +256,38 @@ function Update-HolidaySchedule {
         return
     }
 
-    $existingRangeStrings = $existingRanges | ForEach-Object {
-        "$($_.Start)|$($_.End)"
-    }
+    # Combine + dedupe by calendar day to avoid "same start range" error
+    $combinedByDate = @{}
 
-    $combined = @()
-    $combined += $existingRanges
-
-    foreach ($r in $holidayRanges) {
-        $key = "$($r.Start)|$($r.End)"
-        if ($existingRangeStrings -notcontains $key) {
-            $combined += $r
-        }
-        else {
-            Add-LogLine "Skipping duplicate holiday range: $($r.Start) to $($r.End)"
+    foreach ($r in $existingRanges + $holidayRanges) {
+        $key = $r.Start.Date.ToString("yyyy-MM-dd")
+        if (-not $combinedByDate.ContainsKey($key)) {
+            $start = Get-Date -Year $r.Start.Year -Month $r.Start.Month -Day $r.Start.Day -Hour 0 -Minute 0 -Second 0
+            $end   = Get-Date -Year $r.Start.Year -Month $r.Start.Month -Day $r.Start.Day -Hour 23 -Minute 59 -Second 59
+            $combinedByDate[$key] = @{
+                Start = $start
+                End   = $end
+            }
         }
     }
 
-    # De-duplicate by date (one range per calendar day)
-    $dateGroups = $combined | Group-Object {
-        ([DateTime]$_.Start).Date
-    }
+    $finalRanges = $combinedByDate.Values | Sort-Object Start
 
-    $finalRanges = @()
-    foreach ($g in $dateGroups) {
-        $d = $g.Group | Select-Object -First 1
-        $finalRanges += @{
-            Start = ([DateTime]$d.Start).ToString("yyyy-MM-ddT00:00:00")
-            End   = ([DateTime]$d.End).ToString("yyyy-MM-ddT23:59:59")
-        }
-    }
-
-    Add-LogLine "Will update schedule '$scheduleName' with $($finalRanges.Count) total ranges."
+    Add-LogLine "Will update schedule '$($schedule.Name)' with $($finalRanges.Count) total ranges."
 
     if ($WhatIf) {
-        Add-LogLine "[WhatIf] Would update schedule '$scheduleName' with $($finalRanges.Count) ranges (future only)."
+        Add-LogLine "[WhatIf] Would update schedule '$($schedule.Name)' with $($finalRanges.Count) ranges (future only added)."
         return
     }
 
     try {
-        Add-LogLine "Updating schedule '$scheduleName'..."
+        Add-LogLine "Updating schedule '$($schedule.Name)'..."
         Set-CsOnlineSchedule -Identity $schedule.Id -DateTimeRanges $finalRanges -ErrorAction Stop | Out-Null
-        Add-LogLine "Successfully updated schedule '$scheduleName'."
+        Add-LogLine "Successfully updated schedule '$($schedule.Name)'."
         Add-LogLine "IMPORTANT: Confirm this holiday schedule is still linked to the correct Auto Attendant in the Teams admin centre."
     }
     catch {
-        Add-LogLine "ERROR updating schedule '$scheduleName' : $($_.Exception.Message)"
+        Add-LogLine "ERROR updating schedule '$($schedule.Name)' : $($_.Exception.Message)"
     }
 }
 
@@ -553,19 +537,17 @@ if ($script:btnLogo) {
 }
 
 #-----------------------------#
-# Populate Existing Holiday Schedules (using "*Public Holidays*")
+# Populate Existing Holiday Schedules
 #-----------------------------#
 function Refresh-HolidaySchedulesView {
     if (-not (Ensure-TeamsConnection)) { return }
 
     try {
-        # Use name pattern like "*Public Holidays*" and handle FixedSchedule / DateTimeRanges
         $holidaySchedules = Get-CsOnlineSchedule -ErrorAction Stop |
             Where-Object { $_.Name -like "*Public Holidays*" }
 
         $holidayData = foreach ($schedule in $holidaySchedules) {
 
-            # Choose correct range source
             $ranges = if ($schedule.FixedSchedule -and $schedule.FixedSchedule.DateTimeRanges) {
                 $schedule.FixedSchedule.DateTimeRanges
             }
